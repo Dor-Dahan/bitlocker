@@ -10,8 +10,8 @@ import shutil
 # ===============================
 #  Configurable Defaults
 # ===============================
-DEFAULT_USER = "OPER"
-DEFAULT_PASS = "Ab123456"
+DEFAULT_USER = "AdminDefault"
+DEFAULT_PASS = "1234"
 
 # ===============================
 #  Helper functions
