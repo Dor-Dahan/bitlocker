@@ -1,0 +1,262 @@
+import subprocess
+import tkinter as tk
+from tkinter import messagebox, scrolledtext
+import os
+import threading
+import sys
+import json
+import shutil
+
+# ===============================
+#  Configurable Defaults
+# ===============================
+DEFAULT_USER = "AdminDefault"
+DEFAULT_PASS = "1234"
+
+# ===============================
+#  Helper functions
+# ===============================
+def run_powershell(command):
+    """Run PowerShell command and return output or raise error."""
+    result = subprocess.run(
+        ["powershell", "-Command", command],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        raise Exception(result.stderr.strip())
+    return result.stdout.strip()
+
+def log(message):
+    """Append text to the log box."""
+    log_box.config(state="normal")
+    log_box.insert(tk.END, message + "\n")
+    log_box.see(tk.END)
+    log_box.config(state="disabled")
+
+# ===============================
+#  BitLocker Logic
+# ===============================
+def resource_path(relative_path):
+    """Get absolute path to resource, works in dev and PyInstaller."""
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+def get_script_drive():
+    """Return the drive letter where this script/exe is running."""
+    return os.path.splitdrive(os.path.abspath(sys.argv[0]))[0] + "\\"
+
+def start_bitlocker():
+    pcn = entry_pcn.get().strip()
+    pin = entry_pin.get().strip()
+
+    if not pcn:
+        messagebox.showerror("Error", "Please enter a PC name.")
+        return
+    if not (pin.isdigit() and 4 <= len(pin) <= 20):
+        messagebox.showerror("Error", "PIN must be 4–20 digits (numbers only).")
+        return
+
+    start_btn.config(state="disabled")
+    disable_btn.config(state="disabled")
+    log_box.config(state="normal")
+    log_box.delete("1.0", tk.END)
+    log_box.config(state="disabled")
+
+    def worker():
+        try:
+            run_powershell("Set-ExecutionPolicy RemoteSigned -Scope Process -Force")
+            log("✅ ExecutionPolicy set to RemoteSigned.")
+
+            # Create recovery folder
+            recovery_folder = r"C:\BitLockerRecovery"
+            os.makedirs(recovery_folder, exist_ok=True)
+            recovery_file = os.path.join(recovery_folder, f"RecoveryKey_pcn{pcn}.txt")
+            log("📁 Created recovery folder...")
+
+            # Configure BitLocker GPO
+            reg_cmds = [
+                'New-Item -Path "HKLM:\\SOFTWARE\\Policies\\Microsoft\\FVE" -Force | Out-Null',
+                'Set-ItemProperty -Path "HKLM:\\SOFTWARE\\Policies\\Microsoft\\FVE" -Name "EnableBDEWithNoTPM" -Value 0 -Type DWord',
+                'Set-ItemProperty -Path "HKLM:\\SOFTWARE\\Policies\\Microsoft\\FVE" -Name "UseAdvancedStartup" -Value 1 -Type DWord',
+                'Set-ItemProperty -Path "HKLM:\\SOFTWARE\\Policies\\Microsoft\\FVE" -Name "UseTPM" -Value 2 -Type DWord',
+                'Set-ItemProperty -Path "HKLM:\\SOFTWARE\\Policies\\Microsoft\\FVE" -Name "UseTPMKey" -Value 2 -Type DWord',
+                'Set-ItemProperty -Path "HKLM:\\SOFTWARE\\Policies\\Microsoft\\FVE" -Name "UseTPMKeyPIN" -Value 2 -Type DWord',
+                'Set-ItemProperty -Path "HKLM:\\SOFTWARE\\Policies\\Microsoft\\FVE" -Name "UseTPMPIN" -Value 2 -Type DWord'
+            ]
+            for cmd in reg_cmds:
+                run_powershell(cmd)
+            log("✅ Group Policy configured for TPM + PIN.")
+
+            # Write recovery info
+            with open(recovery_file, "a", encoding="utf-8") as f:
+                f.write(f"PC Name: {pcn}\n")
+                f.write(f"Startup PIN: {pin}\n")
+                f.write("----------------------------------------\n")
+
+            # Enable BitLocker
+            status = run_powershell('(Get-BitLockerVolume -MountPoint "C:").VolumeStatus')
+            if "FullyEncrypted" not in status:
+                log("🚀 Enabling BitLocker (TPM + PIN)...")
+                enable_cmd = (
+                    f'Enable-BitLocker -MountPoint "C:" -EncryptionMethod Aes256 '
+                    f'-Pin (ConvertTo-SecureString "{pin}" -AsPlainText -Force) '
+                    f'-TPMandPinProtector'
+                )
+                run_powershell(enable_cmd)
+                log("🔒 BitLocker encryption started.")
+            else:
+                log("ℹ️ Drive already encrypted. Skipping enable step.")
+
+            # Add Recovery Key Protector
+            try:
+                run_powershell('Add-BitLockerKeyProtector -MountPoint "C:" -RecoveryPasswordProtector | Out-Null')
+                log("💾 Added recovery password protector.")
+            except Exception:
+                log("⚠️ Recovery key already exists, skipping add.")
+
+            # Get Protector Info
+            protector_info = run_powershell(
+                '(Get-BitLockerVolume -MountPoint "C:").KeyProtector | '
+                'Where-Object { $_.KeyProtectorType -eq "RecoveryPassword" } | '
+                'Select-Object -Last 1 | Select KeyProtectorId, RecoveryPassword | ConvertTo-Json'
+            )
+            try:
+                info = json.loads(protector_info)
+                if isinstance(info, list):
+                    info = info[-1]
+                key_id = info.get("KeyProtectorId", "Unknown")
+                recovery_password = info.get("RecoveryPassword", "Unknown")
+            except Exception:
+                key_id = "Unknown"
+                recovery_password = "Unknown"
+
+            with open(recovery_file, "a", encoding="utf-8") as f:
+                f.write(f"KeyProtector ID: {key_id}\n")
+                f.write(f"Recovery Password: {recovery_password}\n")
+
+            log("✅ BitLocker setup complete.")
+            log(f"🆔 KeyProtector ID: {key_id}")
+            log(f"📄 Saved recovery info to:\n{recovery_file}")
+
+            # Copy recovery file to USB
+            usb_drive = get_script_drive()
+            usb_folder = os.path.join(usb_drive, "BitLockerRecoveryCopy")
+            os.makedirs(usb_folder, exist_ok=True)
+            shutil.copy(recovery_file, usb_folder)
+            log(f"✅ Recovery file copied to USB: {usb_folder}")
+
+            messagebox.showinfo("✅ Success", f"BitLocker configured successfully!\n\nRecovery file copied to:\n{usb_folder}")
+
+        except Exception as e:
+            messagebox.showerror("❌ Error", str(e))
+            log(f"❌ ERROR: {str(e)}")
+        finally:
+            start_btn.config(state="normal")
+            disable_btn.config(state="normal")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+def disable_bitlocker():
+    """Disable BitLocker using PowerShell."""
+    def worker():
+        try:
+            log("⏳ Disabling BitLocker on C: drive...")
+            run_powershell('Disable-BitLocker -MountPoint "C:"')
+            log("🔓 BitLocker decryption started.")
+            messagebox.showinfo("✅ Done", "BitLocker decryption started successfully.")
+        except Exception as e:
+            messagebox.showerror("❌ Error", str(e))
+            log(f"❌ ERROR: {str(e)}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+# ===============================
+#  GUI Setup
+# ===============================
+root = tk.Tk()
+root.title("BitLocker TPM + PIN Setup")
+root.geometry("480x520")
+root.configure(bg="#1e1e1e")
+root.resizable(False, False)
+root.attributes("-topmost", True)
+
+bg = "#1e1e1e"
+fg = "#f0f0f0"
+accent = "#0078D7"
+entry_bg = "#2a2a2a"
+entry_fg = "#f8f8f8"
+font_main = ("Segoe UI", 10)
+
+tk.Label(root, text="🛡️ BitLocker TPM + PIN Setup", font=("Segoe UI", 13, "bold"), bg=bg, fg=fg).pack(pady=5)
+
+tk.Label(root, text="💻 PC Name:", font=font_main, bg=bg, fg=fg).pack(anchor="w", padx=30)
+entry_pcn = tk.Entry(root, font=font_main, bg=entry_bg, fg=entry_fg, insertbackground=entry_fg, width=40, relief="flat")
+entry_pcn.pack(padx=30, pady=5)
+
+tk.Label(root, text="🔐 BitLocker PIN (4–20 digits):", font=font_main, bg=bg, fg=fg).pack(anchor="w", padx=30)
+entry_pin = tk.Entry(root, font=font_main, bg=entry_bg, fg=entry_fg, insertbackground=entry_fg, show="*", width=40, relief="flat")
+entry_pin.pack(padx=30, pady=5)
+
+# --- Buttons ---
+btn_frame = tk.Frame(root, bg=bg)
+btn_frame.pack(pady=10)
+
+start_btn = tk.Button(
+    btn_frame,
+    text="▶ Start Setup",
+    font=("Segoe UI", 10, "bold"),
+    bg=accent,
+    fg="white",
+    activebackground="#005a9e",
+    activeforeground="white",
+    relief="flat",
+    command=start_bitlocker,
+    width=16,
+    height=1
+)
+start_btn.grid(row=0, column=0, padx=10)
+
+disable_btn = tk.Button(
+    btn_frame,
+    text="⛔ Disable BitLocker",
+    font=("Segoe UI", 10, "bold"),
+    bg="#D83B01",
+    fg="white",
+    activebackground="#A52A00",
+    activeforeground="white",
+    relief="flat",
+    command=disable_bitlocker,
+    width=16,
+    height=1
+)
+disable_btn.grid(row=0, column=1, padx=10)
+
+# --- Log box ---
+log_box = scrolledtext.ScrolledText(
+    root,
+    width=55,
+    height=10,
+    font=("Consolas", 9),
+    bg="#111",
+    fg="#ccc",
+    insertbackground="white",
+    relief="flat",
+    wrap="word"
+)
+log_box.pack(padx=15, pady=5)
+log_box.config(state="disabled")
+
+# --- Footer ---
+tk.Label(
+    root,
+    text="Made by Dor D.",
+    font=("Segoe UI", 9, "italic"),
+    bg=bg,
+    fg="#888"
+).pack(side="bottom", pady=5)
+
+root.mainloop()
